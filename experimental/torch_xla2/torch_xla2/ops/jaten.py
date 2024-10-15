@@ -41,16 +41,24 @@ mutation_ops_to_functional = {
   torch.ops.aten.random_: torch.ops.aten.uniform,
   torch.ops.aten.uniform_: torch.ops.aten.uniform,
   torch.ops.aten.relu_: torch.ops.aten.relu,
-  torch.ops.aten.squeeze_: torch.ops.aten.squeeze,
+  # squeeze_ is expected to change tensor's shape. So replace with new value 
+  torch.ops.aten.squeeze_: (torch.ops.aten.squeeze, True),
   torch.ops.aten.clamp_: torch.ops.aten.clamp,
   torch.ops.aten.ceil_: torch.ops.aten.ceil,
   torch.ops.aten.logical_not_: torch.ops.aten.logical_not,
   torch.ops.aten.unsqueeze_: torch.ops.aten.unsqueeze,
   torch.ops.aten.transpose_: torch.ops.aten.transpose,
+  torch.ops.aten.log_normal_: torch.ops.aten.log_normal,
+  torch.ops.aten.scatter_add_: torch.ops.aten.scatter_add,
+  torch.ops.aten.scatter_reduce_.two: torch.ops.aten.scatter_reduce,
 }
 
 
 def make_mutation(op):
+  if type(mutation_ops_to_functional[op]) is tuple:
+    return op_base.InplaceOp(mutation_ops_to_functional[op][0],
+                             replace=mutation_ops_to_functional[op][1],
+                             position_to_mutate=0)
   return op_base.InplaceOp(mutation_ops_to_functional[op], position_to_mutate=0)
 
 
@@ -103,7 +111,13 @@ def _aten_add(x, y, *, alpha=1):
 
 @op(torch.ops.aten.copy_, is_jax_function=False)
 def _aten_copy(x, y, memory_format=None):
-  x._elem = y._elem.astype(x._elem.dtype)
+  if x.ndim == 1 and y.ndim == 0:
+    # case of torch.empty((1,)).copy_(tensor(N))
+    # we need to return 0D tensor([N]) and not scalar tensor(N)
+    # ref: https://github.com/pytorch/xla/issues/7505#issuecomment-2395319131
+    x._elem = jnp.array([y._elem.astype(x._elem.dtype)])
+  else:
+    x._elem = y._elem.astype(x._elem.dtype)
   return x
 
 
@@ -1290,7 +1304,8 @@ def _aten_linalg_vector_norm(self, ord=2, dim=None, keepdim=False, dtype=None):
   # Special cases (for efficiency and clarity)
   if ord == 0:
     if self.shape == ():
-      result = jnp.array(float(self != 0))
+      # float sets it to float64. set it back to input type
+      result = jnp.astype(jnp.array(float(self != 0)), self.dtype)
     else:
       result = _with_reduction_scalar(jnp.sum, jnp.where(self != 0, 1, 0), dim, keepdim)
 
@@ -1757,7 +1772,7 @@ def _aten_adaptive_avg_pool(x, output_shape, pool_dim):
   return y
 
 
-# aten.avg_pool2d
+@op(torch.ops.aten.avg_pool1d)
 @op(torch.ops.aten.avg_pool2d)
 @op(torch.ops.aten.avg_pool3d)
 def _aten_avg_pool(
@@ -1772,6 +1787,8 @@ def _aten_avg_pool(
   num_batch_dims = len(inputs.shape) - len(kernel_size) - 1
   kernel_size = tuple(kernel_size)
   strides = tuple(strides) if strides else kernel_size
+  if isinstance(padding, list) and len(padding) == 1:
+    padding = padding[0]
   if isinstance(padding, int):
     padding = [padding for _ in range(len(kernel_size))]
 
@@ -1785,7 +1802,26 @@ def _aten_avg_pool(
   if divisor_override is not None:
     y = y / jnp.array(divisor_override, y.dtype)
   elif count_include_pad:
-    y = y / jnp.array(np.prod(kernel_size), y.dtype)
+    div_shape = list(y.shape)
+    div_by = jnp.ones(div_shape, y.dtype) * np.prod(kernel_size)
+    unequal_paddings = map(lambda pad: pad[0] != pad[1], padding)
+    unequal_padding_indices = np.where(list(unequal_paddings))[0]
+    if len(unequal_padding_indices) > 0:
+      # indices to update kernel size
+      offset = len(div_shape) - len(padding)
+      skip_indices = list(map(lambda x: x + offset, unequal_padding_indices))
+      indices = _generate_indices(div_shape, skip_dim_indices=skip_indices)
+      # updated kernel size accounting for maximum padding
+      new_kernel_size = list(kernel_size)
+      for j in unequal_padding_indices:
+        new_kernel_size[j] = kernel_size[j] - padding[j][1] + padding[j][0]
+
+      for idx in indices:
+        for j in unequal_padding_indices:
+          idx[j + offset] = -1
+        div_by = div_by.at[tuple(idx)].set(np.prod(new_kernel_size))
+
+    y = y / div_by
   else:
     div_shape = list(inputs.shape)
     div_shape[num_batch_dims] = 1
@@ -1800,8 +1836,25 @@ def _aten_avg_pool(
         strides,
         padding,
     )
-  return y
+  return y.astype(inputs.dtype)
 
+# helper function to generate all indices to iterate through ndarray
+def _generate_indices(dims, skip_dim_indices = []):
+  res = []
+  def _helper(curr_dim_idx, sofar):
+    if curr_dim_idx in skip_dim_indices:
+      _helper(curr_dim_idx + 1, sofar[:])
+      return
+    if curr_dim_idx >= len(dims):
+      print(sofar)
+      res.append(sofar)
+      return
+    for i in range(dims[curr_dim_idx]):
+      sofar[curr_dim_idx] = i
+      _helper(curr_dim_idx + 1, sofar[:])
+    
+  _helper(0, [0 for _ in dims])
+  return res
 
 # aten.sym_numel
 # aten.reciprocal
@@ -2520,6 +2573,9 @@ def _aten_nextafter(input, other, *, out=None):
 # aten.nonzero
 @op(torch.ops.aten.nonzero)
 def _aten_nonzero(x):
+  if jnp.ndim(x) == 0: # when x is scalar, return torch.tensor([], size=(1, 0), dtype=torch.int64)
+    res = torch.empty(1, 0, dtype=torch.int64)
+    return jnp.array(res.numpy())
   index_tuple = jnp.nonzero(x)
   index_tuple = [jnp.expand_dims(p, -1) for p in index_tuple]
   return jnp.concatenate(index_tuple, axis=-1)
@@ -4204,7 +4260,7 @@ def _aten__linalg_slogdet(input):
 # torch.linalg.svd
 @op(torch.ops.aten._linalg_svd)
 def _aten__linalg_svd(a, full_matrices=True):
-  return jnp.linalg.svd(a, full_matrices)
+  return jnp.linalg.svd(a, full_matrices=full_matrices)
 
 
 # torch.linalg.pinv
@@ -4216,7 +4272,35 @@ def _aten_linalg_pinv_atol_rtol_tensor(a, rtol=None, **kwargs):
 # torch.linalg.solve
 @op(torch.ops.aten._linalg_solve_ex)
 def _aten__linalg_solve_ex(a, b):
-  return jnp.linalg.solve(a, b), jnp.array(0)
+  res = jnp.linalg.solve(a, b)
+  info_shape = a.shape[0] if len(a.shape) >= 3 else []
+  info = jnp.zeros(info_shape, dtype=mappings.t2j_dtype(torch.int32))
+  return res, info
+
+
+# torch.linalg.solve_triangular
+@op(torch.ops.aten.linalg_solve_triangular)
+def _aten_linalg_solve_triangular(a, b, *, upper=True, left=True, unitriangular=False):
+  if left is False:
+    a = jnp.matrix_transpose(a)
+    b = jnp.matrix_transpose(b)
+    upper = not upper
+  res = jax.scipy.linalg.solve_triangular(a, b, lower=not upper, unit_diagonal=unitriangular)
+  if left is False:
+    res = jnp.matrix_transpose(res)
+  return res
+
+
+@op(torch.ops.aten.linalg_inv_ex)
+def _aten_linalg_inv_ex(a):
+  ainv = jnp.linalg.inv(a)
+  info = jnp.zeros(a.shape[:-2], jnp.int32)
+  return ainv, info
+
+
+@op(torch.ops.aten._linalg_check_errors)
+def _aten__linalg_check_errors(*args, **kwargs):
+  pass
 
 
 @op(torch.ops.aten.median)
@@ -4304,6 +4388,11 @@ def _aten__fft_c2r(self, dim, normalization, last_dim_size):
   return jnp.fft.irfftn(self, norm=norm, axes=dim, s=s)
 
 
+@op(torch.ops.aten._trilinear)
+def _aten_trilinear(i1, i2, i3, expand1, expand2, expand3, sumdim, unroll_dim=1):
+  return _aten_sum(jnp.expand_dims(i1, expand1) * jnp.expand_dims(i2, expand2) * jnp.expand_dims(i3, expand3), sumdim)
+
+
 @op(torch.ops.aten.max_unpool2d)
 @op(torch.ops.aten.max_unpool3d)
 def _aten_max_unpoolxd(input, indices, output_size, stride=None, padding=0):
@@ -4388,3 +4477,86 @@ def _aten_upsample_bilinear2d_aa(input, output_size, align_corners, scale_factor
         translation=translation,
         antialias=antialias,
     )
+
+@op(torch.ops.aten.cdist)
+def _aten_cdist(x1, x2, p=2.0, compute_mode='use_mm_for_euclid_dist_if_necessary'):
+  x1 = x1.astype(jnp.float32)
+  x2 = x2.astype(jnp.float32)
+
+  if p == 0.0:
+    # For p = 0, use Hamming-like distance multiplied by the number of elements
+    return _hamming_distance(x1, x2).astype(jnp.float32)
+  elif p == 2.0:
+    # Use optimized Euclidean distance calculation
+    if compute_mode == 'use_mm_for_euclid_dist_if_necessary' and (x1.shape[-2] > 25 or x2.shape[-2] > 25):
+      return _euclidean_mm(x1, x2)
+    elif compute_mode == 'use_mm_for_euclid_dist':
+      return _euclidean_mm(x1, x2)
+    else:
+      return _euclidean_direct(x1, x2)
+  else:
+    # General p-norm distance calculation
+    diff = jnp.abs(jnp.expand_dims(x1, -2) - jnp.expand_dims(x2, -3))
+    return jnp.sum(jnp.power(diff, p), axis=-1).astype(jnp.float32) ** (1 / p)
+
+def _hamming_distance(x1, x2):
+  """
+  Computes the Hamming-like distance for p=0.
+
+  Args:
+      x1: JAX array of shape (..., P, M)
+      x2: JAX array of shape (..., R, M)
+
+  Returns:
+      JAX array of shape (..., P, R) representing pairwise Hamming distances.
+  """
+  diff = jnp.not_equal(jnp.expand_dims(x1, -2), jnp.expand_dims(x2, -3))
+
+  hamming_dist = jnp.sum(diff, axis=-1).astype(jnp.float32)
+
+  return hamming_dist
+
+def _euclidean_mm(x1, x2):
+  """
+  Computes the Euclidean distance using matrix multiplication.
+
+  Args:
+      x1: JAX array of shape (..., P, M)
+      x2: JAX array of shape (..., R, M)
+
+  Returns:
+      JAX array of shape (..., P, R) representing pairwise Euclidean distances.
+  """
+  x1_sq = jnp.sum(x1 ** 2, axis=-1, keepdims=True).astype(jnp.float32)
+  x2_sq = jnp.sum(x2 ** 2, axis=-1, keepdims=True).astype(jnp.float32)
+
+  x2_sq = jnp.swapaxes(x2_sq, -2, -1)
+
+  dot_product = jnp.matmul(x1, jnp.swapaxes(x2, -1, -2))
+
+  dist_sq = x1_sq + x2_sq - 2 * dot_product
+  dist_sq = jnp.maximum(dist_sq, 0.0)
+  dist = jnp.sqrt(dist_sq).astype(jnp.float32)
+
+  return dist
+
+def _euclidean_direct(x1, x2):
+  """
+  Computes the Euclidean distance directly without matrix multiplication.
+
+  Args:
+      x1: JAX array of shape (..., P, M)
+      x2: JAX array of shape (..., R, M)
+
+  Returns:
+      JAX array of shape (..., P, R) representing pairwise Euclidean distances.
+  """
+  diff = jnp.expand_dims(x1, -2) - jnp.expand_dims(x2, -3)
+
+  dist_sq = jnp.sum(diff ** 2, axis=-1).astype(jnp.float32)
+
+  dist_sq = jnp.maximum(dist_sq, 0.0)
+
+  dist = jnp.sqrt(dist_sq).astype(jnp.float32)
+
+  return dist

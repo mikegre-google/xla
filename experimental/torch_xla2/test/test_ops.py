@@ -15,7 +15,6 @@ skiplist = {
     "bincount", # NOTE: dtype for int input torch gives float. This is weird.
     "byte",
     "cat",
-    "cdist",
     "cholesky",
     "cholesky_solve",
     "diagonal_copy",
@@ -29,8 +28,6 @@ skiplist = {
     "linalg.cholesky",
     "linalg.cholesky_ex",
     "linalg.det",
-    "linalg.inv",
-    "linalg.inv_ex",
     "linalg.ldl_factor",
     "linalg.ldl_factor_ex",
     "linalg.ldl_solve",
@@ -40,18 +37,7 @@ skiplist = {
     "linalg.lu_solve",
     "linalg.matrix_norm",
     "linalg.matrix_power",
-    "linalg.solve_ex",
-    "linalg.solve_triangular",
-    "linalg.svd",
-    "linalg.svdvals",
-    "linalg.tensorinv",
     "linalg.tensorsolve",
-    "linalg.vector_norm",
-    "linspace",
-    "log_normal",
-    "logspace",
-    "lu",
-    "lu_solve",
     "lu_unpack",
     "masked.median",
     "max_pool2d_with_indices_backward",
@@ -60,10 +46,6 @@ skiplist = {
     "nn.functional.adaptive_max_pool2d",
     "nn.functional.adaptive_max_pool3d",
     "nn.functional.alpha_dropout",
-    "nn.functional.avg_pool1d",
-    "nn.functional.avg_pool2d",
-    "nn.functional.avg_pool3d",
-    "nn.functional.bilinear",
     "nn.functional.conv_transpose1d",
     "nn.functional.conv_transpose2d",
     "nn.functional.conv_transpose3d",
@@ -119,7 +101,6 @@ skiplist = {
     "unique",
     "unravel_index",
     "var_mean",
-    "argwhere",
     "nanmean",
     "nn.functional.upsample_bilinear",
     "randint",
@@ -160,9 +141,16 @@ random_ops = {
   'nn.functional.feature_alpha_dropout',
   'cauchy',
   'exponential',
+  'log_normal',
 }
 
-atol_dict = {"matrix_exp": (2e-1, 2e-4), "linalg.pinv": (8e-1, 2e0), "linalg.eig": (2e0, 3e0), "linalg.eigh": (5e1, 3e0), "linalg.eigvalsh": (5e1, 3e0)}
+atol_dict = {"linalg.eig": (2e0, 3e0),
+             "linalg.eigh": (5e1, 3e0),
+             "linalg.eigvalsh": (5e1, 3e0),
+             "linalg.pinv": (8e-1, 2e0),
+             "linalg.svd": (1e0, 1e0),
+             "matrix_exp": (2e-1, 2e-4),
+             "cdist": (5e1, 3e0)}
 
 def diff_output(testcase, output1, output2, rtol, atol, equal_nan=True, check_output=True):
   if isinstance(output1, torch.Tensor):
@@ -261,6 +249,15 @@ class TestOpInfo(TestCase):
         continue
       check_output = op.name not in random_ops
 
+      #print("[DEBUG] sample_input: ", sample_input)
+
+      # TODO: this is a workaround to skip int64 cast for linspace
+      # reference: https://github.com/pytorch/xla/issues/7505#issuecomment-2400895692 and subsequent comments
+      # we have opened a bug in pytorch: https://github.com/pytorch/pytorch/issues/137546
+      if op.name == "linspace":
+        if 'dtype' in sample_input.kwargs:
+          if sample_input.kwargs['dtype'] == torch.int64:
+            sample_input.kwargs['dtype'] = torch.float
       if op.name == "special.polygamma":
         # The polygamma function is inaccurate for values < 1.
         # To avoid errors during testing, replace values below 1 with 1.
