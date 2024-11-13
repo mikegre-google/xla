@@ -44,6 +44,9 @@ mutation_ops_to_functional = {
   # squeeze_ is expected to change tensor's shape. So replace with new value 
   torch.ops.aten.squeeze_: (torch.ops.aten.squeeze, True),
   torch.ops.aten.clamp_: torch.ops.aten.clamp,
+  torch.ops.aten.clamp_min_: torch.ops.aten.clamp_min,
+  torch.ops.aten.sigmoid_: torch.ops.aten.sigmoid,
+  torch.ops.aten.tanh_: torch.ops.aten.tanh,
   torch.ops.aten.ceil_: torch.ops.aten.ceil,
   torch.ops.aten.logical_not_: torch.ops.aten.logical_not,
   torch.ops.aten.unsqueeze_: torch.ops.aten.unsqueeze,
@@ -621,12 +624,6 @@ def _ones(size: Sequence[int], dtype=None, **kwargs):
 @op_base.convert_dtype()
 def _zeros(size: Sequence[int], dtype=None, **kwargs):
   return jnp.zeros(size, dtype)
-
-
-@op(torch.ops.aten.eye)
-@op_base.convert_dtype()
-def _eye(n: int, m: Optional[int] = None, *, dtype=None, **kwargs):
-  return jnp.eye(n, m, dtype=dtype)
 
 
 @op(torch.ops.aten.full)
@@ -1891,7 +1888,6 @@ def _generate_indices(dims, skip_dim_indices = []):
       _helper(curr_dim_idx + 1, sofar[:])
       return
     if curr_dim_idx >= len(dims):
-      print(sofar)
       res.append(sofar)
       return
     for i in range(dims[curr_dim_idx]):
@@ -2157,6 +2153,10 @@ def _aten_broadcast_to(input, shape):
 @op(torch.ops.aten.clamp.Tensor)
 def _aten_clamp(self, min=None, max=None):
   return jnp.clip(self, min, max)
+
+@op(torch.ops.aten.clamp_min)
+def _aten_clamp_min(input, min):
+  return jnp.clip(input, min=min)
 
 
 # aten.constant_pad_nd
