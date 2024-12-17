@@ -3,6 +3,7 @@
 #include <torch/csrc/lazy/core/ir_metadata.h>
 
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -110,23 +111,31 @@ LoweringContext::LoweringContext(
 static constexpr int64_t kUnboundedSize = std::numeric_limits<int64_t>::min();
 
 xla::XlaOp LoweringContext::GetParameter(
-    const std::shared_ptr<torch::lazy::BackendData>& data,
+    const std::shared_ptr<torch::lazy::BackendData>& backend_data,
     const std::unordered_set<uint32_t>& unbounded_dynamic_dims) {
-  torch::lazy::BackendData::Handle handle = data->GetHandle();
+  torch::lazy::BackendData::Handle handle = backend_data->GetHandle();
   auto it = parameters_map_.find(handle);
   if (it == parameters_map_.end()) {
-    xla::Shape shape =
-        std::dynamic_pointer_cast<runtime::ComputationClient::Data>(data)
-            ->shape();
+    auto data = std::dynamic_pointer_cast<runtime::ComputationClient::Data>(
+        backend_data);
+    XLA_CHECK(data != nullptr);
+    xla::Shape shape = data->shape();
     for (const int dim : unbounded_dynamic_dims) {
       shape.set_dynamic_dimension(dim, true);
       shape.set_dimensions(dim, kUnboundedSize);
     }
-    xla::XlaOp param = xla::Parameter(builder(), parameters_.size(), shape,
-                                      absl::StrCat("p", parameters_.size()));
-    it = parameters_map_.emplace(handle, Parameter{param, parameters_.size()})
-             .first;
-    parameters_.push_back(data);
+    size_t param_index = parameters_.size();
+    std::string param_name = absl::StrCat("p", param_index);
+    xla::XlaOp param;
+    if (data->HasSharding()) {
+      xla::OpSharding sharding = data->GetSharding();
+      xla::XlaScopedShardingAssignment scoped_sharding(builder(), sharding);
+      param = xla::Parameter(builder(), param_index, shape, param_name);
+    } else {
+      param = xla::Parameter(builder(), param_index, shape, param_name);
+    }
+    it = parameters_map_.emplace(handle, Parameter{param, param_index}).first;
+    parameters_.push_back(backend_data);
   } else {
     XLA_CHECK(unbounded_dynamic_dims.empty())
         << "The unbounded dynamic dims can only be set when Parameter is "
@@ -134,6 +143,16 @@ xla::XlaOp LoweringContext::GetParameter(
   }
   parameter_sequence_.push_back(it->second.index);
   return it->second.param;
+}
+
+std::optional<size_t> LoweringContext::GetParameterId(
+    const std::shared_ptr<torch::lazy::BackendData>& backend_data) const {
+  torch::lazy::BackendData::Handle handle = backend_data->GetHandle();
+  auto it = parameters_map_.find(handle);
+  if (it == parameters_map_.end()) {
+    return std::nullopt;
+  }
+  return it->second.index;
 }
 
 const std::vector<torch::lazy::BackendDataPtr>&
@@ -195,13 +214,14 @@ void LoweringContext::AssignOutputOp(const torch::lazy::Output& output,
 
 xla::XlaOp LoweringContext::GetOutputOp(const torch::lazy::Output& output) {
   auto it = emitted_outputs_.find(output);
+
   if (it == emitted_outputs_.end()) {
     auto post_order =
         torch::lazy::Util::ComputePostOrder(output.node, &emit_status_);
     for (auto node : post_order) {
       LowerNode(node);
     }
-    // At this point the outpout better be present, otherwise there is an issue
+    // At this point the output better be present, otherwise there is an issue
     // with the lowering code.
     it = emitted_outputs_.find(output);
     XLA_CHECK(it != emitted_outputs_.end())
@@ -216,6 +236,7 @@ XlaOpVector LoweringContext::LowerNode(const torch::lazy::Node* node) {
     HloMetadataSetter meta_setter(this, node);
 
     const XlaNode* casted = dynamic_cast<const XlaNode*>(node);
+
     result_ops = casted->Lower(this);
     if (!casted->dynamic_dims().empty()) {
       xla::internal::XlaBuilderFriend builder_friend;

@@ -227,7 +227,7 @@ class JaxTrainer:
                 with xla_env:
                     loss = jittable_mod.functional_call(
                         'training_step',
-                        weights, buffers, (data, batch_id))
+                        weights, buffers, data, batch_id)
                 return jax_view(loss)
 
         jax_optimizer = self.torch_opt_to_jax_opt(

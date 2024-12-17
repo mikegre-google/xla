@@ -978,10 +978,14 @@ void BuildProfilerSubmodule(py::module* m) {
 
 class PyLoweringContext {
  public:
-  PyLoweringContext() : PyLoweringContext(bridge::GetCurrentDevice()) {}
+  PyLoweringContext()
+      : PyLoweringContext("PyLoweringContext", bridge::GetCurrentDevice()) {}
 
-  PyLoweringContext(torch::lazy::BackendDevice device)
-      : lowering_ctx("PyLoweringContext", device) {}
+  PyLoweringContext(const std::string& name)
+      : PyLoweringContext(name, bridge::GetCurrentDevice()) {}
+
+  PyLoweringContext(const std::string& name, torch::lazy::BackendDevice device)
+      : lowering_ctx(name, device) {}
 
   // Builds a HLO graph given a set of output tensors.
   void Build(std::vector<at::Tensor> tensors) {
@@ -1002,6 +1006,9 @@ class PyLoweringContext {
           torch::lazy::Output(ir_value.node.get(), ir_value.index));
       lowering_ctx.AddResult(root);
     }
+
+    ShardingUtil::SetHloSharding(&lowering_ctx);
+
     computation = ConsumeValue(lowering_ctx.BuildXla());
   }
 
@@ -1044,21 +1051,27 @@ class PyLoweringContext {
       }
     }
 
+    ShardingUtil::SetHloSharding(&lowering_ctx);
+
     computation = ConsumeValue(lowering_ctx.BuildXla());
 
     // wrap inputs of cond/body_computation
     if ((GetNameString() == "condctx") || (GetNameString() == "bodyctx")) {
       std::vector<std::pair<int64_t, int64_t>> input_output_alias_pair;
-      std::vector<size_t> buffer_donor_indices;
+      std::vector<xla::HloSharding> param_shardings;
+      // If sharded, then extract all input Op shardings.
+      if (UseVirtualDevice()) {
+        param_shardings = XlaHelpers::ExtractInputShardings(computation);
+      }
       xla::ProgramShape program_shape =
           ConsumeValue(computation.GetProgramShape());
       // TODO(@manfei): please confirm whether we check for more than two or use
       // default value true
       bool should_wrap_parameter = (program_shape.parameters_size() >= 2);
       if (should_wrap_parameter) {
-        // For now we assume that we for i loop input is not sharded.
         computation = ConsumeValue(XlaHelpers::WrapXlaComputation(
-            computation, program_shape.parameters(), {}, buffer_donor_indices));
+            computation, program_shape.parameters(), param_shardings,
+            /* buffer_donor_indices */ {}));
       }
     }
   }
@@ -1066,10 +1079,9 @@ class PyLoweringContext {
   // Get a mapping from the HLO input parameters to the backing Tensor values.
   // This allows the caller to get all parameter information regardless of
   // how the parameter was allocated (inline tensor, nn.Parameter, constant,
-  // etc.)
+  // etc.). This will copy the tensor data from the device to the host.
   std::unordered_map<int64_t, at::Tensor> GetParameterIdTensorMapping() {
     // Find parameters in the lowering
-    const std::vector<size_t>& param_ids = lowering_ctx.GetParameterSequence();
     const std::vector<torch::lazy::BackendDataPtr>& device_data =
         lowering_ctx.GetParametersData();
 
@@ -1086,15 +1098,45 @@ class PyLoweringContext {
       at::ScalarType dtype =
           MaybeUpcastToHostTorchType(literal.shape().element_type());
       at::Tensor input = MakeTensorFromXlaLiteral(literal, dtype);
-      results[param_ids[i]] = input;
+      std::optional param_id = lowering_ctx.GetParameterId(device_data[i]);
+      XLA_CHECK(param_id.has_value());
+      results[param_id.value()] = input;
     }
     return results;
   }
 
+  // Returns a mapping from HLO parameter IDs to their corresponding
+  // device-backed Tensors. This version only returns parameters that were
+  // explicitly allocated on device data, accessible via GetTensorParameterId().
+  // Unlike GetParameterIdTensorMapping(), it avoids transferring data from
+  // device to host, making it more efficient especially for SPMD scenarios
+  // where transferring data involves costly collectives.
+  std::unordered_map<int64_t, at::Tensor> GetDeviceParameterIdTensorMapping() {
+    // Find parameters in the lowering
+    const std::vector<torch::lazy::BackendDataPtr>& device_data =
+        lowering_ctx.GetParametersData();
+
+    // Create a mapping from parameter id to the tensor data
+    std::unordered_map<int64_t, at::Tensor> param_to_tensor;
+    param_to_tensor.reserve(device_data.size());
+
+    for (const auto& data : device_data) {
+      std::optional<int64_t> param_id = lowering_ctx.GetParameterId(data);
+      XLA_CHECK(param_id.has_value())
+          << "Parameter ID must exist for device data";
+
+      at::Tensor tensor =
+          bridge::AtenFromXlaTensor(torch_xla::XLATensor::Create(data));
+      param_to_tensor.emplace(param_id.value(), std::move(tensor));
+    }
+    return param_to_tensor;
+  }
+
   // Get the parameter identifier of a given tensor. If the tensor is not a
   // parameter this will always return -1. This is useful in conjunction with
-  // GetParameterIdTensorMapping to identify which values can be baked into
-  // the graph and which values must remain parameters.
+  // GetParameterIdTensorMapping or GetDeviceParameterIdTensorMapping, to
+  // identify which values can be baked into the graph and which values must
+  // remain parameters.
   int64_t GetTensorParameterId(at::Tensor tensor) {
     // Convert tensor into the backing lazy node
     XLATensorPtr xtensor = bridge::GetXlaTensor(tensor);
@@ -1109,12 +1151,13 @@ class PyLoweringContext {
     torch::lazy::BackendData::Handle handle = data->GetHandle();
 
     // Linearly search parameters and compare opaque handles
-    const std::vector<size_t>& param_ids = lowering_ctx.GetParameterSequence();
     const std::vector<torch::lazy::BackendDataPtr>& device_data =
         lowering_ctx.GetParametersData();
     for (int i = 0; i < device_data.size(); ++i) {
       if (device_data[i]->GetHandle() == handle) {
-        return param_ids[i];
+        std::optional param_id = lowering_ctx.GetParameterId(device_data[i]);
+        XLA_CHECK(param_id.has_value());
+        return param_id.value();
       }
     }
     return -1;
@@ -1186,7 +1229,8 @@ void BuildLoweringContextSubmodule(py::module* m) {
   py::class_<PyLoweringContext, std::unique_ptr<PyLoweringContext>>
       lowering_context_class(lowering, "LoweringContext", py::module_local());
 
-  lowering_context_class.def(py::init<>())
+  lowering_context_class.def(py::init())
+      .def(py::init<std::string>())
       .def("build", &PyLoweringContext::Build)
       .def("buildforiloop", &PyLoweringContext::BuildForiLoop)
       .def("hlo", &PyLoweringContext::GetHlo)
@@ -1194,6 +1238,8 @@ void BuildLoweringContextSubmodule(py::module* m) {
       .def("hlo_json", &PyLoweringContext::GetHloJsonText)
       .def("parameter_id_tensor_mapping",
            &PyLoweringContext::GetParameterIdTensorMapping)
+      .def("device_parameter_id_tensor_mapping",
+           &PyLoweringContext::GetDeviceParameterIdTensorMapping)
       .def("tensor_parameter_id", &PyLoweringContext::GetTensorParameterId)
       .def("set_name_string", &PyLoweringContext::SetNameString)
       .def("get_name_string", &PyLoweringContext::GetNameString);
@@ -2504,6 +2550,8 @@ void InitXlaModuleBindings(py::module m) {
           FLAGS_torch_lazy_all_numbers_special_scalars =
               all_numbers_special_scalars;
         });
+  m.def("_get_xla_all_numbers_special_scalars",
+        []() { return FLAGS_torch_lazy_all_numbers_special_scalars; });
   m.def("_set_xla_handle_special_scalars", [](bool handle_special_scalars) {
     FLAGS_torch_lazy_handle_special_scalars = handle_special_scalars;
   });

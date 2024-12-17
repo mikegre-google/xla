@@ -21,6 +21,7 @@ import copy
 import itertools
 import math
 from numbers import Number
+from functools import reduce
 import numpy
 import random
 import re
@@ -816,6 +817,33 @@ class TestAtenXlaTensor(test_utils.XlaTestCase):
     # HLO generated needs to have type f32 as well
     self.assertIn("f64[4,2]",
                   torch_xla._XLAC._get_xla_tensors_text([real]).split('\n')[-3])
+
+  @skipIfFunctionalizationDisabled("view_as_real unsupported")
+  def test_view_as_complex_f32(self):
+    xla_device = torch_xla.device()
+    x = torch.randn(4, 2, device=xla_device)
+    complex = torch.view_as_complex(x)
+    self.assertEqual(complex.dtype, torch.complex64)
+    # XLA type of the real needs to be f32 as well
+    self.assertIn("c64[4]", torch_xla._XLAC._get_xla_tensor_debug_info(complex))
+    # HLO generated needs to have type f32 as well
+    self.assertIn(
+        "c64[4]",
+        torch_xla._XLAC._get_xla_tensors_text([complex]).split('\n')[-3])
+
+  @skipIfFunctionalizationDisabled("view_as_real unsupported")
+  def test_view_as_complex_f64(self):
+    xla_device = torch_xla.device()
+    x = torch.randn(4, 2, dtype=torch.float64, device=xla_device)
+    complex = torch.view_as_complex(x)
+    self.assertEqual(complex.dtype, torch.complex128)
+    # XLA type of the real needs to be f32 as well
+    self.assertIn("c128[4]",
+                  torch_xla._XLAC._get_xla_tensor_debug_info(complex))
+    # HLO generated needs to have type f32 as well
+    self.assertIn(
+        "c128[4]",
+        torch_xla._XLAC._get_xla_tensors_text([complex]).split('\n')[-3])
 
   def test_index_put(self):
     xla_device = xm.xla_device()
@@ -2606,20 +2634,51 @@ class RegisterXLAKeyTest(test_utils.XlaTestCase):
 class TestLoweringContext(test_utils.XlaTestCase):
 
   def test_api(self):
+    met.clear_all()
     device = xm.xla_device()
     a = torch.tensor([1.0, 2.0, 3.0], device=device)
     b = torch.tensor([4.0, 5.0, 6.0], device=device)
 
     result = a + b
 
+    ctx = torch_xla._XLAC.lowering.LoweringContext("MyCustomName")
+    ctx.build([result])
+    _ = ctx.hlo()
+    hlo_text = ctx.hlo_text()
+    self.assertIn('MyCustomName', hlo_text)
+    self.assertTrue(hlo_text.count('opcode: "parameter"'), 2)
+    self.assertIn('opcode: "add"', hlo_text)
+    num_expected_params = 2
+    mapping = ctx.parameter_id_tensor_mapping()
+    self.assertEqual(len(mapping), num_expected_params)
+    self.assertTrue(met.metric_data("TransferFromDeviceTime"))
+    met.clear_all()
+    device_mapping = ctx.device_parameter_id_tensor_mapping()
+    self.assertEqual(len(device_mapping), num_expected_params)
+    self.assertFalse(met.metric_data("TransferFromDeviceTime"))
+
+  def test_get_parameters_scalar(self):
+    """Scalar tensors parameters may be shared in the HLO graph if their
+    numerical values are equal. `parameter_id_tensor_mapping` needs to handle
+    that appropriately.
+    """
+
+    device = torch_xla.device()
+    tensors = []
+    for i in range(10):
+      # Add three copies of the same value.
+      tensors.append(torch.tensor(i, device=device))
+      tensors.append(torch.tensor(i, device=device))
+      tensors.append(torch.tensor(i, device=device))
+    result = reduce(lambda a, b: a + b, tensors)
     ctx = torch_xla._XLAC.lowering.LoweringContext()
     ctx.build([result])
-    hlo = ctx.hlo()
-    hlo_text = ctx.hlo_text()
-    self.assertTrue('opcode: "parameter"' in hlo_text)
-    self.assertTrue('opcode: "add"' in hlo_text)
     mapping = ctx.parameter_id_tensor_mapping()
-    self.assertEqual(len(mapping), 2)
+
+    import json
+    hlo_json = json.loads(ctx.hlo_json())
+    num_parameters = len(hlo_json["hostProgramShape"]["parameters"])
+    self.assertEqual(len(mapping), num_parameters)
 
 
 class TestGeneric(test_utils.XlaTestCase):
@@ -2940,8 +2999,7 @@ class TestDLPack(parameterized.TestCase):
   @onlyIfPJRTDeviceIsCUDA
   def test_dlpack_xla_to_pytorch_cuda_protocol_conversion(self):
     xla_t1 = torch.arange(5).to(xm.xla_device())
-    caps_t1 = torch.utils.dlpack.to_dlpack(xla_t1)
-    cuda_t1 = torch.utils.dlpack.from_dlpack(caps_t1)
+    cuda_t1 = torch.utils.dlpack.from_dlpack(xla_t1)
     self.assertEqual(cuda_t1.device.type, 'cuda')
     self.assertEqual(cuda_t1.device.index, xla_t1.device.index)
     cuda_t1[0] = cuda_t1[0] + 20

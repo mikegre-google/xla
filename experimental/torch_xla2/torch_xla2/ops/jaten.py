@@ -43,6 +43,7 @@ mutation_ops_to_functional = {
   torch.ops.aten.relu_: torch.ops.aten.relu,
   # squeeze_ is expected to change tensor's shape. So replace with new value 
   torch.ops.aten.squeeze_: (torch.ops.aten.squeeze, True),
+  torch.ops.aten.sqrt_: torch.ops.aten.sqrt,
   torch.ops.aten.clamp_: torch.ops.aten.clamp,
   torch.ops.aten.clamp_min_: torch.ops.aten.clamp_min,
   torch.ops.aten.sigmoid_: torch.ops.aten.sigmoid,
@@ -112,7 +113,11 @@ def _aten_add(x, y, *, alpha=1):
 
   assert x.dtype == y.dtype, (x.dtype, y.dtype)
   """
-  return x + y * alpha
+  res = x + y * alpha
+  if isinstance(x, float) or isinstance(y, float):
+    new_dtype = mappings.t2j_dtype(torch.get_default_dtype())
+    res = res.astype(new_dtype)
+  return res
 
 
 @op(torch.ops.aten.copy_, is_jax_function=False)
@@ -169,6 +174,16 @@ def _aten_cauchy_(x, median=0, sigma=1):
   return x.at[:].set(samples)
 
 
+@op(torch.ops.aten.atleast_2d)
+def _aten_atleast_2d(inputs):
+  return jnp.atleast_2d(inputs)
+
+
+@op(torch.ops.aten.atleast_1d)
+def _aten_atleast_1d(inputs):
+  return jnp.atleast_1d(inputs)
+
+
 # aten.complex
 @op(torch.ops.aten.complex)
 def _aten_complex(real, imag):
@@ -221,6 +236,46 @@ def _aten_index_select(x, dim, index):
   return jnp.take(x, index, dim)
 
 
+@op(torch.ops.aten.cholesky)
+def _aten_cholesky(input, upper=False):
+  return jax.scipy.linalg.cholesky(input, lower=(not upper))
+
+
+@op(torch.ops.aten.linalg_cholesky_ex)
+def _aten_linalg_cholesky_ex(input, upper=False, check_errors=False):
+  if check_errors:
+    raise NotImplementedError(
+        "check_errors=True is not supported in this JAX implementation. "
+        "Check for positive definiteness using jnp.linalg.eigvalsh before "
+        "calling this function."
+    )
+
+  L = jax.scipy.linalg.cholesky(input, lower=not upper)
+  if len(L.shape) >2:
+    info = jnp.zeros(shape=L.shape[:-2], dtype=jnp.int32)
+  else:
+    info = jnp.array(0, dtype=jnp.int32)
+  return L, info
+
+
+@op(torch.ops.aten.cholesky_solve)
+def _aten_cholesky_solve(input, input2, upper=False):
+  # Ensure input2 is lower triangular for cho_solve
+  L = input2 if not upper else input2.T 
+  # Use cho_solve to solve the linear system
+  solution = jax.scipy.linalg.cho_solve((L, True), input)
+  return solution
+
+
+@op(torch.ops.aten.special_zeta)
+def _aten_special_zeta(x, q):
+  new_dtype = mappings.t2j_dtype(torch.get_default_dtype())
+  res = jax.scipy.special.zeta(x, q)
+  if isinstance(x, int) or isinstance(q, int):
+    res = res.astype(new_dtype)
+  return res # jax.scipy.special.zeta(x, q)
+
+
 # aten.igammac
 @op(torch.ops.aten.igammac)
 def _aten_igammac(input, other):
@@ -253,8 +308,13 @@ def _torch_binary_scalar_type(scalar, tensor):
 
 
 @op(torch.ops.aten.searchsorted.Tensor)
-def _aten_searchsorted(sorted_sequence, values):
-  return jnp.searchsorted(sorted_sequence, values)
+def _aten_searchsorted(sorted_sequence, values): 
+  new_dtype = mappings.t2j_dtype(torch.get_default_dtype())
+  res = jnp.searchsorted(sorted_sequence, values)
+  if sorted_sequence.dtype == np.dtype(np.int32) or sorted_sequence.dtype == np.dtype(np.int32):
+    # res = res.astype(new_dtype)
+    res = res.astype(np.dtype(np.int64))
+  return res # jnp.searchsorted(sorted_sequence, values)
 
 
 @op(torch.ops.aten.sub.Tensor)
@@ -269,6 +329,21 @@ def _aten_sub(x, y, alpha=1):
   return x - y*alpha
 
 
+@op(torch.ops.aten.numpy_T)
+def _aten_numpy_T(input):
+  """
+  Jax implementation of torch.numpy_T.
+
+  Args:
+    input: JAX array.
+
+  Returns:
+    Transposed JAX array.
+  """
+  return jnp.transpose(input)
+
+
+
 @op(torch.ops.aten.mm)
 def _aten_mm(x, y):
   res = x @ y
@@ -281,10 +356,15 @@ def _aten_mul(x, y):
   res = x * y
   if isinstance(x, float) or isinstance(y, float):
     res = res.astype(new_dtype)
+  else:
+    if (not isinstance(x, int)) and (not isinstance(y, int)):
+      if x.dtype == np.dtype(np.float64) or y.dtype == np.dtype(np.float64):
+        res = res.astype(new_dtype)
   return res
 
 
 @op(torch.ops.aten.silu)
+@op(torch.ops.aten.silu.default)
 def _aten_silu(x):
   return jax.nn.silu(x)
 
@@ -1283,6 +1363,9 @@ def _aten_native_group_norm(input, weight, bias, N, C, HxW, group, eps=1e-5):
   """
 
   input_shape = input.shape
+
+  if 0 in input_shape:
+    return input, input, input
 
   # Reshape for group-wise normalization
   reshaped_input = jnp.reshape(input, (1, N * group, -1))
@@ -2713,9 +2796,24 @@ def _aten_nextafter(input, other, *, out=None):
   return jnp.nextafter(input, other)
 
 
+@op(torch.ops.aten.nonzero_static)
+def _aten_nonzero_static(input, size, fill_value = -1):
+  indices = jnp.argwhere(input)
+
+  if size < indices.shape[0]:
+    indices = indices[:size]
+  elif size > indices.shape[0]:
+    padding = jnp.full((size - indices.shape[0], indices.shape[1]), fill_value, dtype=indices.dtype)
+    indices = jnp.concatenate((indices, padding))
+
+  return indices
+
+
 # aten.nonzero
 @op(torch.ops.aten.nonzero)
-def _aten_nonzero(x):
+def _aten_nonzero(x, as_tuple=False):
+  if jnp.ndim(x) == 0 and (as_tuple or x.item()==0):
+    return torch.empty(0, 0, dtype=torch.int64)
   if jnp.ndim(x) == 0: # when x is scalar, return torch.tensor([], size=(1, 0), dtype=torch.int64)
     res = torch.empty(1, 0, dtype=torch.int64)
     return jnp.array(res.numpy())
@@ -4559,8 +4657,8 @@ def _aten__linalg_slogdet(input):
 
 # torch.linalg.svd
 @op(torch.ops.aten._linalg_svd)
-def _aten__linalg_svd(a, full_matrices=True):
-  return jnp.linalg.svd(a, full_matrices=full_matrices)
+def _aten__linalg_svd(a, full_matrices=False, **kwargs):
+  return jnp.linalg.svd(a, full_matrices=full_matrices, **kwargs)
 
 
 # torch.linalg.pinv
